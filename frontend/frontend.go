@@ -3,23 +3,25 @@ package frontend
 import (
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/pboehm/ddns/admin"
 	"github.com/pboehm/ddns/shared"
 	"html/template"
 	"log"
 	"net"
 	"net/http"
-	"regexp"
 )
 
 type Frontend struct {
 	config *shared.Config
 	hosts  shared.HostBackend
+	admin  *admin.Admin
 }
 
-func NewFrontend(config *shared.Config, hosts shared.HostBackend) *Frontend {
+func NewFrontend(config *shared.Config, hosts shared.HostBackend, adminPanel *admin.Admin) *Frontend {
 	return &Frontend{
 		config: config,
 		hosts:  hosts,
+		admin:  adminPanel,
 	}
 }
 
@@ -32,6 +34,10 @@ func (f *Frontend) Run() error {
 	}
 
 	r.SetHTMLTemplate(buildTemplate())
+
+	if f.admin != nil {
+		f.admin.Register(r)
+	}
 
 	r.GET("/", func(g *gin.Context) {
 		g.HTML(200, "index.html", gin.H{"domain": f.config.Domain})
@@ -67,6 +73,7 @@ func (f *Frontend) Run() error {
 
 		host := &shared.Host{Hostname: hostname, Ip: "127.0.0.1"}
 		host.GenerateAndSetToken()
+		host.Touch()
 
 		if err = f.hosts.SetHost(host); err != nil {
 			c.JSON(400, gin.H{"error": "Could not register host."})
@@ -104,7 +111,7 @@ func (f *Frontend) Run() error {
 			return
 		}
 
-		ip, err := extractRemoteAddr(c.Request)
+		ip, err := ExtractRemoteAddr(c.Request)
 		if err != nil {
 			c.JSON(400, gin.H{
 				"error": "Your sender IP address is not in the right format",
@@ -113,6 +120,7 @@ func (f *Frontend) Run() error {
 		}
 
 		host.Ip = ip
+		host.Touch()
 		if err = f.hosts.SetHost(host); err != nil {
 			c.JSON(400, gin.H{
 				"error": "Could not update registered IP address",
@@ -128,10 +136,10 @@ func (f *Frontend) Run() error {
 	return r.Run(f.config.ListenFrontend)
 }
 
-// Get the Remote Address of the client. At First we try to get the
+// ExtractRemoteAddr gets the Remote Address of the client. At First we try to get the
 // X-Forwarded-For Header which holds the IP if we are behind a proxy,
 // otherwise the RemoteAddr is used
-func extractRemoteAddr(req *http.Request) (string, error) {
+func ExtractRemoteAddr(req *http.Request) (string, error) {
 	header_data, ok := req.Header["X-Forwarded-For"]
 
 	if ok {
@@ -153,7 +161,5 @@ func buildTemplate() *template.Template {
 }
 
 func isValidHostname(host string) (string, bool) {
-	valid, _ := regexp.Match("^([a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?)$", []byte(host))
-
-	return host, valid
+	return host, shared.IsValidHostname(host)
 }
