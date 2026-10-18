@@ -1,8 +1,10 @@
 package shared
 
 import (
-	"crypto/sha1"
-	"fmt"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -23,12 +25,18 @@ type Host struct {
 	ExpiresIn time.Duration `redis:"-"`
 }
 
+// GenerateAndSetToken gives the host a new random token of 256 bits.
 func (h *Host) GenerateAndSetToken() {
-	hash := sha1.New()
-	hash.Write([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-	hash.Write([]byte(h.Hostname))
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		panic(err)
+	}
+	h.Token = hex.EncodeToString(token)
+}
 
-	h.Token = fmt.Sprintf("%x", hash.Sum(nil))
+// HasToken compares token with the host's token in constant time.
+func (h *Host) HasToken(token string) bool {
+	return h.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(token)) == 1
 }
 
 // Touch records that the record has just been set.
@@ -51,10 +59,17 @@ func IsValidHostname(name string) bool {
 	return hostnamePattern.MatchString(name)
 }
 
+// ErrHostExists is returned by CreateHost when the name is taken.
+var ErrHostExists = errors.New("Host already exists")
+
 type HostBackend interface {
 	GetHost(string) (*Host, error)
 
 	SetHost(*Host) error
+
+	// CreateHost stores a new host atomically, failing with ErrHostExists
+	// if a host of that name exists.
+	CreateHost(*Host) error
 }
 
 // HostManager is a HostBackend that can also enumerate and remove hosts.

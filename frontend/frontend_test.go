@@ -1,0 +1,184 @@
+package frontend
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pboehm/ddns/shared"
+	"github.com/stretchr/testify/assert"
+)
+
+type memoryHosts map[string]*shared.Host
+
+func (m memoryHosts) GetHost(name string) (*shared.Host, error) {
+	if host, ok := m[name]; ok {
+		copied := *host
+		return &copied, nil
+	}
+	return nil, errors.New("Host does not exist")
+}
+
+func (m memoryHosts) SetHost(host *shared.Host) error {
+	copied := *host
+	m[host.Hostname] = &copied
+	return nil
+}
+
+func (m memoryHosts) CreateHost(host *shared.Host) error {
+	if _, ok := m[host.Hostname]; ok {
+		return shared.ErrHostExists
+	}
+	return m.SetHost(host)
+}
+
+func newFrontend(registration string, perHour int) (*gin.Engine, memoryHosts) {
+	gin.SetMode(gin.TestMode)
+	hosts := memoryHosts{}
+	config := &shared.Config{Domain: ".d.example.org", Registration: registration, RegistrationsPerHour: perHour}
+	return NewFrontend(config, hosts, nil).Router(), hosts
+}
+
+func get(r *gin.Engine, path string, header ...string) (*httptest.ResponseRecorder, map[string]interface{}) {
+	req := httptest.NewRequest("GET", path, nil)
+	req.RemoteAddr = "192.0.2.10:4711"
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	body := map[string]interface{}{}
+	json.Unmarshal(w.Body.Bytes(), &body)
+	return w, body
+}
+
+func TestRegisterAndUpdate(t *testing.T) {
+	r, hosts := newFrontend("open", 5)
+
+	w, body := get(r, "/new/pi")
+	assert.Equal(t, http.StatusOK, w.Code)
+	token := body["token"].(string)
+	assert.Regexp(t, "^[0-9a-f]{64}$", token)
+	assert.NotZero(t, hosts["pi"].UpdatedAt)
+
+	w, _ = get(r, "/update/pi/wrong")
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	w, body = get(r, "/update/pi/"+token)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "192.0.2.10", hosts["pi"].Ip)
+
+	w, _ = get(r, "/update/pi")
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+	w, _ = get(r, "/update/pi", "Authorization", "Bearer wrong")
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	w, _ = get(r, "/update/pi", "Authorization", "Bearer "+token, "X-Forwarded-For", "198.51.100.7")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "198.51.100.7", hosts["pi"].Ip)
+}
+
+func TestRegistrationRateLimit(t *testing.T) {
+	r, hosts := newFrontend("open", 2)
+
+	for _, name := range []string{"a", "b"} {
+		w, _ := get(r, "/new/"+name)
+		assert.Equal(t, http.StatusOK, w.Code)
+	}
+	w, _ := get(r, "/new/c")
+	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+	assert.NotContains(t, hosts, "c")
+
+	// failed registrations do not count
+	r, _ = newFrontend("open", 1)
+	get(r, "/new/bad.name")
+	w, _ = get(r, "/new/ok")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// slowHosts is a store whose writes take a while, so concurrent requests
+// overlap in the handler.
+type slowHosts struct {
+	mu    sync.Mutex
+	hosts memoryHosts
+}
+
+func (s *slowHosts) GetHost(name string) (*shared.Host, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hosts.GetHost(name)
+}
+func (s *slowHosts) SetHost(host *shared.Host) error {
+	time.Sleep(20 * time.Millisecond)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hosts.SetHost(host)
+}
+func (s *slowHosts) CreateHost(host *shared.Host) error {
+	time.Sleep(20 * time.Millisecond)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hosts.CreateHost(host)
+}
+
+func TestRegistrationRateLimitWithConcurrentRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &slowHosts{hosts: memoryHosts{}}
+	config := &shared.Config{Domain: ".d.example.org", Registration: "open", RegistrationsPerHour: 1}
+	r := NewFrontend(config, store, nil).Router()
+
+	var wg sync.WaitGroup
+	codes := make([]int, 12)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w, _ := get(r, fmt.Sprintf("/new/host%d", i))
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	ok := 0
+	for _, code := range codes {
+		if code == http.StatusOK {
+			ok++
+		}
+	}
+	assert.Equal(t, 1, ok)
+	assert.Len(t, store.hosts, 1)
+}
+
+func TestTakenHostnameDoesNotUseQuota(t *testing.T) {
+	r, _ := newFrontend("open", 2)
+
+	w, _ := get(r, "/new/a")
+	assert.Equal(t, http.StatusOK, w.Code)
+	w, _ = get(r, "/new/a")
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	w, _ = get(r, "/new/b")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestClosedRegistration(t *testing.T) {
+	r, hosts := newFrontend("closed", 5)
+
+	w, _ := get(r, "/new/pi")
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Empty(t, hosts)
+
+	_, body := get(r, "/available/pi")
+	assert.Equal(t, false, body["available"])
+
+	w, _ = get(r, "/")
+	assert.Contains(t, w.Body.String(), "Registration is closed")
+	assert.NotContains(t, w.Body.String(), `id="register"`)
+}
