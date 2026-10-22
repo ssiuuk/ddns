@@ -101,3 +101,33 @@ func TestConcurrentUpdatesKeepBothAddresses(t *testing.T) {
 	_, err = r.UpdateHost("missing", func(*Host) error { return nil })
 	assert.ErrorIs(t, err, ErrHostNotFound)
 }
+
+func TestRecordTTLInRedis(t *testing.T) {
+	r := testRedis(t)
+	assert.Nil(t, r.Load(&Snapshot{Version: snapshotVersion}))
+
+	ttl, err := r.RecordTTL()
+	assert.Nil(t, err)
+	assert.Equal(t, DefaultRecordTTL, ttl)
+
+	assert.NotNil(t, r.SetRecordTTL(0))
+	assert.NotNil(t, r.SetRecordTTL(MaxRecordTTL+1))
+	assert.Nil(t, r.SetRecordTTL(300))
+	ttl, err = r.RecordTTL()
+	assert.Nil(t, err)
+	assert.Equal(t, 300, ttl)
+
+	// it is part of dumps, and so of syncs, and recorded as a change
+	snapshot, err := r.Dump()
+	assert.Nil(t, err)
+	var found bool
+	for _, item := range snapshot.Entries {
+		found = found || item.Key == recordTTLKey
+	}
+	assert.True(t, found)
+	state, err := r.SyncState()
+	assert.Nil(t, err)
+	changed, err := r.ChangedSince(0, state.Seq)
+	assert.Nil(t, err)
+	assert.Contains(t, changed, recordTTLKey)
+}

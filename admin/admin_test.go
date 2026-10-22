@@ -19,7 +19,16 @@ type memoryStore struct {
 	hosts  map[string]*shared.Host
 	hash   string
 	secret []byte
+	ttl    int
 }
+
+func (m *memoryStore) RecordTTL() (int, error) {
+	if m.ttl == 0 {
+		return shared.DefaultRecordTTL, nil
+	}
+	return m.ttl, nil
+}
+func (m *memoryStore) SetRecordTTL(ttl int) error { m.ttl = ttl; return nil }
 
 func (m *memoryStore) GetHost(name string) (*shared.Host, error) {
 	if host, ok := m.hosts[name]; ok {
@@ -321,4 +330,31 @@ func TestGoogleLoginRedirect(t *testing.T) {
 	w = c.do("GET", "/admin/login/google/callback?state=forged&code=x", nil)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 	assert.Nil(t, c.cookies[sessionCookie])
+}
+
+func TestSetRecordTTL(t *testing.T) {
+	c, store := loggedIn(t)
+	csrf := c.csrf()
+
+	w := c.do("GET", "/admin", nil)
+	assert.Contains(t, w.Body.String(), `name="ttl" value="5"`)
+
+	for _, bad := range []string{"0", "86401", "five", ""} {
+		w = c.do("POST", "/admin/settings/ttl", url.Values{"csrf": {csrf}, "ttl": {bad}})
+		assert.Equal(t, http.StatusBadRequest, w.Code, bad)
+		assert.Contains(t, w.Body.String(), "Please enter a number of seconds")
+	}
+	assert.Zero(t, store.ttl)
+
+	w = c.do("POST", "/admin/settings/ttl", url.Values{"ttl": {"300"}})
+	assert.Equal(t, "/admin?msg=bad-request", w.Header().Get("Location"))
+	assert.Zero(t, store.ttl)
+
+	w = c.do("POST", "/admin/settings/ttl", url.Values{"csrf": {csrf}, "ttl": {" 300 "}})
+	assert.Equal(t, "/admin?msg=ttl", w.Header().Get("Location"))
+	assert.Equal(t, 300, store.ttl)
+
+	w = c.do("GET", "/admin?msg=ttl", nil)
+	assert.Contains(t, w.Body.String(), `name="ttl" value="300"`)
+	assert.Contains(t, w.Body.String(), "The TTL has been saved")
 }
