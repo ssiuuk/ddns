@@ -37,7 +37,7 @@ form.inline { display:inline; }
 .row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
 .row > label { flex:1 1 180px; }
 label { display:block; font-size:13px; color:var(--muted); }
-input[type=text], input[type=password], input[type=search] { display:block; width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+input[type=text], input[type=password], input[type=search], input[type=number] { display:block; width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
 label.check { display:flex; align-items:center; gap:6px; color:var(--text); font-size:14px; flex:0 0 auto; padding-bottom:8px; }
 button, .button { display:inline-block; padding:8px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; font:inherit; cursor:pointer; text-decoration:none; }
 button.secondary { background:transparent; color:var(--accent); }
@@ -124,6 +124,19 @@ dd { margin:0; }
   {{else}}
   <p class="muted">{{if .Filter}}No host matches “{{.Filter}}”.{{else}}No hosts yet.{{end}}</p>
   {{end}}
+</div>
+
+<div class="card">
+  <h2>Record TTL</h2>
+  <p class="muted">How long resolvers may cache the A and AAAA records of every host. After a host changes its address, some clients keep using the old one for up to this long, so keep it short for hosts on dynamic addresses. The default is {{.DefaultTTL}} seconds.</p>
+  {{if .TTLError}}<div class="error">{{.TTLError}}</div>{{end}}
+  <form method="post" action="/admin/settings/ttl">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label>TTL in seconds<input type="number" name="ttl" value="{{.TTL}}" min="{{.MinTTL}}" max="{{.MaxTTL}}" required></label>
+      <button>Save</button>
+    </div>
+  </form>
 </div>
 
 {{if .DNSSEC}}

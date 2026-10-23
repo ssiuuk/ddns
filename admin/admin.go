@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 type Store interface {
 	shared.HostManager
 	shared.KeyStore
+	shared.RecordTTLStore
 
 	AdminPasswordHash() (string, error)
 	SetAdminPasswordHash(string) error
@@ -41,6 +43,7 @@ var messages = map[string]string{
 	"updated":     "The host has been updated.",
 	"token":       "A new token has been generated. The old update URL no longer works.",
 	"deleted":     "The host has been deleted.",
+	"ttl":         "The TTL has been saved. Resolvers pick it up as their cached records expire.",
 	"logged-out":  "You have been signed out.",
 	"not-found":   "This host does not exist or has expired.",
 	"bad-request": "The form has expired, please try again.",
@@ -63,6 +66,7 @@ func (a *Admin) Register(r *gin.Engine) {
 	authed.POST("/hosts/:hostname", a.updateHost)
 	authed.POST("/hosts/:hostname/token", a.regenerateToken)
 	authed.POST("/hosts/:hostname/delete", a.deleteHost)
+	authed.POST("/settings/ttl", a.setRecordTTL)
 }
 
 func securityHeaders(c *gin.Context) {
@@ -258,6 +262,12 @@ func humanDuration(d time.Duration) string {
 }
 
 func (a *Admin) listHosts(c *gin.Context) {
+	a.renderHosts(c, http.StatusOK, gin.H{}, "")
+}
+
+// renderHosts shows the host list with the forms for a new host and the
+// settings; data adds to or overrides what the page shows.
+func (a *Admin) renderHosts(c *gin.Context, status int, data gin.H, formError string) {
 	hosts, err := a.store.ListHosts()
 	if err != nil {
 		c.String(http.StatusInternalServerError, "Could not list hosts: %v", err)
@@ -283,15 +293,46 @@ func (a *Admin) listHosts(c *gin.Context) {
 		}
 	}
 
-	a.render(c, http.StatusOK, "hosts.html", gin.H{
-		"Title":     "Hosts",
-		"Hosts":     views,
-		"Total":     len(hosts),
-		"Filter":    filter,
-		"DNSSEC":    a.config.DNSSEC,
-		"DSRecords": dsRecords,
-		"Form":      gin.H{},
-	})
+	ttl, err := a.store.RecordTTL()
+	if err != nil {
+		log.Printf("Could not read the record TTL: %v", err)
+	}
+
+	page := gin.H{
+		"Title":      "Hosts",
+		"Hosts":      views,
+		"Total":      len(hosts),
+		"Filter":     filter,
+		"DNSSEC":     a.config.DNSSEC,
+		"DSRecords":  dsRecords,
+		"Form":       gin.H{},
+		"FormError":  formError,
+		"TTL":        ttl,
+		"MinTTL":     shared.MinRecordTTL,
+		"MaxTTL":     shared.MaxRecordTTL,
+		"DefaultTTL": shared.DefaultRecordTTL,
+	}
+	for key, value := range data {
+		page[key] = value
+	}
+	a.render(c, status, "hosts.html", page)
+}
+
+func (a *Admin) setRecordTTL(c *gin.Context) {
+	value := strings.TrimSpace(c.PostForm("ttl"))
+	ttl, err := strconv.Atoi(value)
+	if err != nil || ttl < shared.MinRecordTTL || ttl > shared.MaxRecordTTL {
+		a.renderHosts(c, http.StatusBadRequest, gin.H{
+			"TTL":      value,
+			"TTLError": fmt.Sprintf("Please enter a number of seconds from %d to %d.", shared.MinRecordTTL, shared.MaxRecordTTL),
+		}, "")
+		return
+	}
+	if err := a.store.SetRecordTTL(ttl); err != nil {
+		a.renderHosts(c, http.StatusInternalServerError, gin.H{"TTL": value, "TTLError": "Could not save the TTL: " + err.Error()}, "")
+		return
+	}
+	c.Redirect(http.StatusSeeOther, "/admin?msg=ttl")
 }
 
 // parseAddresses reads the ipv4 and ipv6 form fields. At least one is
@@ -322,14 +363,7 @@ func (a *Admin) createHost(c *gin.Context) {
 	form := gin.H{"Hostname": hostname, "IPv4": c.PostForm("ipv4"), "IPv6": c.PostForm("ipv6"), "Persistent": c.PostForm("persistent") != ""}
 
 	fail := func(message string) {
-		hosts, _ := a.store.ListHosts()
-		var views []*hostView
-		for _, host := range hosts {
-			views = append(views, a.view(host))
-		}
-		a.render(c, http.StatusBadRequest, "hosts.html", gin.H{
-			"Title": "Hosts", "Hosts": views, "Total": len(hosts), "Form": form, "FormError": message,
-		})
+		a.renderHosts(c, http.StatusBadRequest, gin.H{"Form": form}, message)
 	}
 
 	if !shared.IsValidHostname(hostname) {

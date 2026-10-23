@@ -3,15 +3,24 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ssiuhk/ddns/shared"
 )
 
-// recordTTL is the TTL of every record we serve. It is short on purpose, as
-// hosts are expected to change their address at any time.
-const recordTTL = 5
+// zoneTTL is the TTL of the SOA and NS records, which rarely change. The
+// TTL of host records is a setting, see shared.DefaultRecordTTL.
+const zoneTTL = 3600
+
+// negativeTTL is how long resolvers remember that a host does not exist, the
+// SOA minimum. It is short, so a new host resolves right away.
+const negativeTTL = 5
+
+// ttlRefresh is how often the host record TTL is read from the store.
+const ttlRefresh = 5 * time.Second
 
 // zoneID is the domain id we report to PowerDNS for the single zone we serve.
 const zoneID = 1
@@ -37,10 +46,14 @@ type Response struct {
 type HostLookup struct {
 	config *shared.Config
 	hosts  shared.HostBackend
+
+	mu      sync.Mutex
+	ttl     int
+	ttlRead time.Time
 }
 
 func NewHostLookup(config *shared.Config, hostsBackend shared.HostBackend) *HostLookup {
-	return &HostLookup{config, hostsBackend}
+	return &HostLookup{config: config, hosts: hostsBackend}
 }
 
 // Lookup returns every record matching the request. PowerDNS mostly asks for
@@ -52,11 +65,11 @@ func (l *HostLookup) Lookup(request *Request) ([]*Response, error) {
 
 	if queryName == l.config.Zone() {
 		records = []*Response{
-			l.record(request.QName, "SOA", fmt.Sprintf("%s. hostmaster.%s. %d 1800 3600 7200 5",
-				l.config.SOAFqdn, l.config.Zone(), l.currentSOASerial())),
+			l.record(request.QName, "SOA", fmt.Sprintf("%s. hostmaster.%s. %d 1800 3600 7200 %d",
+				l.config.SOAFqdn, l.config.Zone(), l.currentSOASerial(), negativeTTL), zoneTTL),
 		}
 		for _, ns := range l.nameservers() {
-			records = append(records, l.record(request.QName, "NS", ns))
+			records = append(records, l.record(request.QName, "NS", ns, zoneTTL))
 		}
 	} else {
 		hostname, err := l.extractHostname(queryName)
@@ -69,11 +82,12 @@ func (l *HostLookup) Lookup(request *Request) ([]*Response, error) {
 			return nil, err
 		}
 
+		ttl := l.recordTTL()
 		if host.IPv4 != "" {
-			records = append(records, l.record(request.QName, "A", host.IPv4))
+			records = append(records, l.record(request.QName, "A", host.IPv4, ttl))
 		}
 		if host.IPv6 != "" {
-			records = append(records, l.record(request.QName, "AAAA", host.IPv6))
+			records = append(records, l.record(request.QName, "AAAA", host.IPv6, ttl))
 		}
 	}
 
@@ -95,8 +109,31 @@ func (l *HostLookup) Lookup(request *Request) ([]*Response, error) {
 	return matching, nil
 }
 
-func (l *HostLookup) record(qname, qtype, content string) *Response {
-	return &Response{QType: qtype, QName: qname, Content: content, TTL: recordTTL, DomainID: zoneID, Auth: true}
+func (l *HostLookup) record(qname, qtype, content string, ttl int) *Response {
+	return &Response{QType: qtype, QName: qname, Content: content, TTL: ttl, DomainID: zoneID, Auth: true}
+}
+
+// recordTTL returns the TTL of host records the admin set, read at most every
+// ttlRefresh. When it can not be read, the last one read stays in use.
+func (l *HostLookup) recordTTL() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.ttl == 0 {
+		l.ttl = shared.DefaultRecordTTL
+	}
+	store, ok := l.hosts.(shared.RecordTTLStore)
+	if !ok || time.Since(l.ttlRead) < ttlRefresh {
+		return l.ttl
+	}
+	l.ttlRead = time.Now()
+	ttl, err := store.RecordTTL()
+	if err != nil {
+		log.Printf("Could not read the record TTL, using %d seconds: %v", l.ttl, err)
+		return l.ttl
+	}
+	l.ttl = ttl
+	return ttl
 }
 
 func (l *HostLookup) nameservers() []string {

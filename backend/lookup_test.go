@@ -5,11 +5,21 @@ import (
 	"github.com/ssiuhk/ddns/shared"
 	"github.com/stretchr/testify/assert"
 	"testing"
+	"time"
 )
 
 type testHostBackend struct {
 	hosts map[string]*shared.Host
+	ttl   int
 }
+
+func (b *testHostBackend) RecordTTL() (int, error) {
+	if b.ttl == 0 {
+		return shared.DefaultRecordTTL, nil
+	}
+	return b.ttl, nil
+}
+func (b *testHostBackend) SetRecordTTL(ttl int) error { b.ttl = ttl; return nil }
 
 func (b *testHostBackend) GetHost(hostname string) (*shared.Host, error) {
 	host, ok := b.hosts[hostname]
@@ -73,7 +83,7 @@ func buildLookup(domain string) (*shared.Config, *testHostBackend, *HostLookup) 
 		},
 	}
 
-	return config, hosts, &HostLookup{config, hosts}
+	return config, hosts, NewHostLookup(config, hosts)
 }
 
 func buildRequest(queryName, queryType string) *Request {
@@ -90,7 +100,11 @@ func assertSingle(t *testing.T, records []*Response, err error, qtype, qname, co
 		assert.Equal(t, qtype, records[0].QType)
 		assert.Equal(t, qname, records[0].QName)
 		assert.Equal(t, content, records[0].Content)
-		assert.Equal(t, 5, records[0].TTL)
+		want := 5
+		if qtype == "NS" || qtype == "SOA" {
+			want = 3600
+		}
+		assert.Equal(t, want, records[0].TTL)
 	}
 }
 
@@ -185,4 +199,33 @@ func TestRequestHandling(t *testing.T) {
 
 	records, err = lookup.Lookup(buildRequest("dual.example.org.", "AAAA"))
 	assertSingle(t, records, err, "AAAA", "dual.example.org.", "2001:db8::40")
+}
+
+func TestRecordTTLs(t *testing.T) {
+	_, hosts, lookup := buildLookup(".example.org")
+	hosts.ttl = 300
+
+	records, err := lookup.Lookup(buildRequest("dual.example.org.", "ANY"))
+	assert.Nil(t, err)
+	if assert.Len(t, records, 2) {
+		assert.Equal(t, 300, records[0].TTL)
+		assert.Equal(t, 300, records[1].TTL)
+	}
+
+	// the zone records keep their own TTL, and the SOA minimum, which
+	// resolvers cache missing hosts for, stays short
+	records, err = lookup.Lookup(buildRequest("example.org.", "SOA"))
+	assert.Nil(t, err)
+	if assert.Len(t, records, 1) {
+		assert.Equal(t, 3600, records[0].TTL)
+		assert.Regexp(t, " 5$", records[0].Content)
+	}
+
+	// a change is picked up after a few seconds, not on every query
+	hosts.ttl = 60
+	records, _ = lookup.Lookup(buildRequest("www.example.org.", "A"))
+	assert.Equal(t, 300, records[0].TTL)
+	lookup.ttlRead = time.Time{}
+	records, _ = lookup.Lookup(buildRequest("www.example.org.", "A"))
+	assert.Equal(t, 60, records[0].TTL)
 }

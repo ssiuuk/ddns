@@ -179,8 +179,16 @@ zone first, or validating resolvers will reject the then unsigned answers.
 ### Admin panel
 
 `ddns` has a control panel for a single administrator at `https://ddns.example.net/admin`, where you can list, show,
-create, update and delete hosts, mark hosts that should never expire, generate new update tokens, and see the DS
-record of the zone.
+create, update and delete hosts, mark hosts that should never expire, generate new update tokens, set the TTL of the
+host records, and see the DS record of the zone.
+
+#### Record TTL
+
+The A and AAAA records of all hosts have a TTL of 5 seconds by default, so an address change reaches clients almost
+right away. The admin panel can set it from 1 second to a day. A longer TTL means fewer queries, but after a host
+changes its address, clients may keep using the old one for up to that long. Secondaries get the setting with the data,
+and pick up a change within seconds. The SOA and NS records have a TTL of an hour, while a missing host is cached for
+only 5 seconds, so a new host resolves right away whatever the setting.
 
 #### Password
 
